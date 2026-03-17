@@ -33,4 +33,5 @@ jobs:
 
           git checkout main
           git reset --hard upstream/main
+          # Safe because this fork's main branch is intended to mirror upstream/main.
           git push origin main --force
