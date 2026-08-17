@@ -4,17 +4,15 @@
 name: Nightly CI Pipeline
 
 on:
-  schedule:
-    - cron: '0 8 * * *' # Every day at 12:00 AM PST (08:00 UTC)
   workflow_dispatch:  # Allow manual triggering for testing
     inputs:
       release:
-        description: 'Stage NGC images, Artifactory wheels, and trigger the GitLab release pipeline. Schedule always sets release=true.'
+        description: 'Stage NGC images, Artifactory wheels, and trigger the GitLab release pipeline.'
         required: false
         type: boolean
         default: false
       run_tests:
-        description: 'Run vllm/sglang/trtllm tests + dynamo-pipeline checks. Schedule always runs them.'
+        description: 'Run vllm/sglang/trtllm tests + dynamo-pipeline checks.'
         required: false
         type: boolean
         default: true

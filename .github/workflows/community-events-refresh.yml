@@ -23,10 +23,6 @@
 name: Community Events Refresh
 
 on:
-  schedule:
-    # Every six hours. Two of the four land either side of Pacific midnight, so
-    # the date rollover reaches the site within roughly six hours of midnight.
-    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 permissions:
