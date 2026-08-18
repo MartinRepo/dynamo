@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Smoke coverage for Dynamo RL worker discovery and direct admin routes."""
+"""Smoke coverage for Dynamo RL worker discovery, direct admin routes, and rollout data."""
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Generator
@@ -20,6 +21,8 @@ from tests.utils.payloads import check_models_api
 from tests.utils.port_utils import ServicePorts, allocate_port, deallocate_port
 
 TEST_MODEL = QWEN
+LOGPROB_ATOL = 1e-6
+TEST_PROMPT = "The three primary colors are red,"
 
 pytestmark = [
     # Heavy e2e (model startup + admin flows, timeout 900s): keep out of pre-merge gating.
@@ -62,6 +65,111 @@ def _post_json(
     data = response.json()
     assert isinstance(data, dict), data
     return data
+
+
+def _get_nvext(payload: dict[str, Any]) -> dict[str, Any]:
+    nvext = payload.get("nvext")
+    return nvext if isinstance(nvext, dict) else {}
+
+
+def _request_tito_completion(
+    *, frontend_port: int, prompt: str | list[int]
+) -> dict[str, Any]:
+    return _post_json(
+        f"http://localhost:{frontend_port}/v1/completions",
+        {
+            "model": TEST_MODEL,
+            "prompt": prompt,
+            "temperature": 0.0,
+            "max_tokens": 32,
+            "stream": False,
+            "logprobs": 0,
+            "nvext": {"extra_fields": ["completion_token_ids", "engine_data"]},
+        },
+    )
+
+
+def _assert_tito_input_parity(*, frontend_port: int) -> None:
+    text_response = _request_tito_completion(
+        frontend_port=frontend_port,
+        prompt=TEST_PROMPT,
+    )
+    text_nvext = _get_nvext(text_response)
+    text_completion_ids = text_nvext.get("completion_token_ids")
+    assert (
+        isinstance(text_completion_ids, list)
+        and text_completion_ids
+        and all(isinstance(token_id, int) for token_id in text_completion_ids)
+    ), text_response
+
+    text_engine_data = text_nvext.get("engine_data")
+    assert isinstance(text_engine_data, dict), text_response
+    prompt_token_ids = text_engine_data.get("prompt_token_ids")
+    assert (
+        isinstance(prompt_token_ids, list)
+        and prompt_token_ids
+        and all(isinstance(token_id, int) for token_id in prompt_token_ids)
+    ), text_response
+    assert (text_response.get("usage") or {}).get("prompt_tokens") == len(
+        prompt_token_ids
+    ), text_response
+
+    token_response = _request_tito_completion(
+        frontend_port=frontend_port,
+        prompt=prompt_token_ids,
+    )
+    token_nvext = _get_nvext(token_response)
+    token_completion_ids = token_nvext.get("completion_token_ids")
+    assert token_completion_ids == text_completion_ids, {
+        "text_completion_ids": text_completion_ids,
+        "token_completion_ids": token_completion_ids,
+    }
+    assert (token_response.get("usage") or {}).get("prompt_tokens") == len(
+        prompt_token_ids
+    ), token_response
+
+    token_engine_data = token_nvext.get("engine_data")
+    assert isinstance(token_engine_data, dict), token_response
+    assert (
+        token_engine_data.get("completion_token_ids") == token_completion_ids
+    ), token_response
+    rl_logprobs = token_engine_data.get("completion_logprobs")
+    assert (
+        isinstance(rl_logprobs, list)
+        and len(rl_logprobs) == len(token_completion_ids)
+        and all(
+            isinstance(value, (int, float)) and math.isfinite(value)
+            for value in rl_logprobs
+        )
+    ), token_response
+
+    choices = token_response.get("choices") or []
+    assert choices and isinstance(choices[0], dict), token_response
+    openai_logprobs = (choices[0].get("logprobs") or {}).get("token_logprobs")
+    assert (
+        isinstance(openai_logprobs, list)
+        and len(openai_logprobs) == len(rl_logprobs)
+        and all(
+            left is not None
+            and math.isclose(left, right, rel_tol=0.0, abs_tol=LOGPROB_ATOL)
+            for left, right in zip(openai_logprobs, rl_logprobs, strict=True)
+        )
+    ), {
+        "openai_logprobs": openai_logprobs,
+        "rl_logprobs": rl_logprobs,
+    }
+    if len(rl_logprobs) > 2:
+        shifted = all(
+            math.isclose(left, right, rel_tol=0.0, abs_tol=LOGPROB_ATOL)
+            for left, right in zip(openai_logprobs[1:], rl_logprobs[:-1], strict=True)
+        ) or all(
+            math.isclose(left, right, rel_tol=0.0, abs_tol=LOGPROB_ATOL)
+            for left, right in zip(openai_logprobs[:-1], rl_logprobs[1:], strict=True)
+        )
+        assert not shifted, {
+            "openai_logprobs": openai_logprobs,
+            "rl_logprobs": rl_logprobs,
+        }
 
 
 def _http_status(url: str) -> int:
@@ -284,16 +392,4 @@ def test_rl_worker_discovery_and_engine_admin_routes(
     resume = _post_json(f"{admin_url}/engine/resume_generation", {})
     assert _status_is_ok(resume)
 
-    inference = requests.post(
-        f"http://localhost:{frontend_port}/v1/chat/completions",
-        json={
-            "model": TEST_MODEL,
-            "messages": [{"role": "user", "content": "Say: hello"}],
-            "max_tokens": 8,
-            "stream": False,
-            "nvext": {"extra_fields": ["engine_data"]},
-        },
-        timeout=60,
-    )
-    assert inference.status_code == 200, inference.text
-    assert inference.json().get("choices")
+    _assert_tito_input_parity(frontend_port=frontend_port)
